@@ -53,6 +53,8 @@ jobs:
           pin="$(tr -d '\r\n' < nx2apple/.upstream-ref)"
           git -C nxnative fetch --quiet --depth=1 origin "$pin"
           git -C nxnative checkout --quiet --detach FETCH_HEAD
+          git -C nxnative config user.name "iBuilder reconstruction test"
+          git -C nxnative config user.email "ci@example.invalid"
           echo "Checked out declared base: $(git -C nxnative rev-parse HEAD)"
           total="$(awk '/^[0-9][0-9][0-9][0-9]-.*\.patch$/ { n++ } END { print n+0 }' nx2apple/patches/series)"
           applied=0
