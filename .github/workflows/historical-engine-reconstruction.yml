@@ -4,13 +4,16 @@ on:
   push:
     branches:
       - recovery/nx2apple-history
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
 
 jobs:
   apply-historical-patch-queue:
-    name: \${{ matrix.label }}
+    name: ${{ matrix.label }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -43,7 +46,7 @@ jobs:
       - name: Fetch the historical NX2Apple patch queue
         shell: bash
         env:
-          NX2APPLE_REF: \${{ matrix.nx2apple_ref }}
+          NX2APPLE_REF: ${{ matrix.nx2apple_ref }}
         run: |
           set -euo pipefail
           git clone --filter=blob:none https://github.com/LNPANDY/NX2Apple.git nx2apple
@@ -80,8 +83,8 @@ jobs:
           done < nx2apple/patches/series
 
           {
-            echo "### \${{ matrix.label }}"
-            echo "- NX2Apple snapshot: \${{ matrix.nx2apple_ref }}"
+            echo "### ${{ matrix.label }}"
+            echo "- NX2Apple snapshot: ${{ matrix.nx2apple_ref }}"
             echo "- Pinned upstream: $pin"
             echo "- Patch queue: $total"
             echo "- Applied cleanly: $applied"
@@ -92,5 +95,5 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "RESULT total=$total applied=$applied first_conflict=\${failed:-none}"
+          echo "RESULT total=$total applied=$applied first_conflict=${failed:-none}"
           [[ -z "$failed" ]]
