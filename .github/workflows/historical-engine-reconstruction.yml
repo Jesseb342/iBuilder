@@ -50,15 +50,15 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          pin="$(tr -d '\\r\\n' < nx2apple/.upstream-ref)"
+          pin="$(tr -d '\r\n' < nx2apple/.upstream-ref)"
           git -C nxnative fetch --quiet --depth=1 origin "$pin"
           git -C nxnative checkout --quiet --detach FETCH_HEAD
           echo "Checked out declared base: $(git -C nxnative rev-parse HEAD)"
-          total="$(awk '/^[0-9][0-9][0-9][0-9]-.*\\.patch$/ { n++ } END { print n+0 }' nx2apple/patches/series)"
+          total="$(awk '/^[0-9][0-9][0-9][0-9]-.*\.patch$/ { n++ } END { print n+0 }' nx2apple/patches/series)"
           applied=0
           failed=""
           while IFS= read -r patch; do
-            [[ -z "$patch" || "$patch" == \\#* ]] && continue
+            [[ -z "$patch" || "$patch" == \#* ]] && continue
             echo "::group::Applying $patch"
             if git -C nxnative am -3 "$GITHUB_WORKSPACE/nx2apple/patches/$patch"; then
               applied=$((applied + 1))
