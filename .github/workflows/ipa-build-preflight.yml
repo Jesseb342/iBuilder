@@ -1,0 +1,100 @@
+name: IPA build input preflight
+
+# This deliberately validates whether a reproducible IPA build can run from this
+# repository plus the official release. It does not pretend to build an IPA when
+# the pinned legacy toolchain inputs are absent.
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/ipa-build-preflight.yml'
+      - 'app/inputs.tsv'
+      - 'scripts/build-app.sh'
+      - 'scripts/build-host.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Inspect official IPA and pinned build inputs
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download and verify official iBuilder 0.1.8 IPA
+        env:
+          IPA_URL: https://github.com/Absenti/iBuilder/releases/download/v0.1.8/GameApp-rust-20261123-142811-rustcf3c2f55.ipa
+          EXPECTED_SHA256: 6f38777d442df4a3d95d8afbfbc26f2979ab44b33eedd545a6567eb26881b966
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ibuilder-preflight"
+          cd "$RUNNER_TEMP/ibuilder-preflight"
+          curl --fail --location --retry 3 "$IPA_URL" -o official.ipa
+          ACTUAL="$(shasum -a 256 official.ipa | awk '{print $1}')"
+          echo "Official release IPA SHA-256: $ACTUAL"
+          test "$ACTUAL" = "$EXPECTED_SHA256"
+          unzip -q official.ipa -d extracted
+          find extracted/Payload -maxdepth 4 -type f | sort > ipa-files.txt
+          echo "IPA archive verified."
+
+      - name: Compare embedded host and report missing source inputs
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/ibuilder-preflight/report.txt"
+          IPA_ROOT="$RUNNER_TEMP/ibuilder-preflight/extracted/Payload"
+          {
+            echo "iBuilder IPA build preflight"
+            echo "Repository commit: $GITHUB_SHA"
+            echo "Official release: Absenti/iBuilder v0.1.8"
+            echo
+            echo "Embedded host candidates:"
+            find "$IPA_ROOT" -type f \( -name '*host*.dylib' -o -name 'host-prebuilt.dylib' \) -print
+            echo
+            echo "Pinned host input:"
+            awk -F '\t' '$1=="host-device" {print "expected bytes=" $3 ", sha256=" $4}' app/inputs.tsv
+          } | tee "$REPORT"
+
+          HOST="$(find "$IPA_ROOT" -type f \( -name 'host-prebuilt.dylib' -o -name 'host-prebuilt-loadable-ios.dylib' \) -print -quit)"
+          if [ -n "$HOST" ]; then
+            ACTUAL="$(shasum -a 256 "$HOST" | awk '{print $1}')"
+            EXPECTED="$(awk -F '\t' '$1=="host-device" {print $4}' app/inputs.tsv)"
+            printf '\nEmbedded host: %s\nEmbedded host SHA-256: %s\nPinned host SHA-256: %s\n' "$HOST" "$ACTUAL" "$EXPECTED" | tee -a "$REPORT"
+            if [ "$ACTUAL" = "$EXPECTED" ]; then
+              echo "HOST_PIN_MATCH=yes" | tee -a "$REPORT"
+            else
+              echo "HOST_PIN_MATCH=no (release IPA host is not byte-identical to the pinned input)" | tee -a "$REPORT"
+            fi
+          else
+            echo "HOST_FOUND=no (no reusable host dylib at the app bundle root)" | tee -a "$REPORT"
+          fi
+
+          echo >> "$REPORT"
+          echo "External inputs required by scripts/build-app.sh:" | tee -a "$REPORT"
+          for item in \
+            "patched engine source/worktree (out-stage/out-engine and tools/patched_engine.sh)" \
+            "iOSBuilder extractor/translator source tree (dm/tools and host profile tables)" \
+            "patched zsign source tree" \
+            "OpenSSL.xcframework" \
+            "zstd decoder source tree" \
+            "SPIRV-Cross iOS/simulator archives and headers"; do
+            echo "MISSING unless supplied by a configured external worktree: $item" | tee -a "$REPORT"
+          done
+          echo >> "$REPORT"
+          echo "Result: IPA build is not launched by this preflight. The release IPA can only replace the host input if its embedded host matches the pinned hash; it does not supply the other source/static-library inputs." | tee -a "$REPORT"
+
+      - name: Upload preflight report
+        if: always()
+        uses: actions/upload-artifact@ea0c6b6f8b7d3a7a8f0e4e2f5a7d8c9b0a1b2c3d # v4.6.2
+        with:
+          name: ibuilder-ipa-build-preflight
+          path: |
+            ${{ runner.temp }}/ibuilder-preflight/report.txt
+            ${{ runner.temp }}/ibuilder-preflight/ipa-files.txt
+          if-no-files-found: warn
+          retention-days: 7
