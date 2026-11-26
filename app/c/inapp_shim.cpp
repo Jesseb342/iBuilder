@@ -29,6 +29,8 @@
 #include <openssl/pkcs12.h>
 #include <openssl/provider.h>
 #include <openssl/x509.h>
+#include <openssl/cms.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 namespace {
 
@@ -37,6 +39,154 @@ void fail(char *error, int length, const char *message) {
 }
 
 bool present(const char *value) { return value && *value; }
+
+std::string cfString(CFTypeRef value) {
+    if (!value || CFGetTypeID(value) != CFStringGetTypeID()) return {};
+    CFStringRef string = static_cast<CFStringRef>(value);
+    CFIndex length = CFStringGetLength(string);
+    CFIndex capacity = CFStringGetMaximumSizeForEncoding(length, kCFStringEncodingUTF8) + 1;
+    if (capacity <= 1 || capacity > 4096) return {};
+    std::string result(static_cast<size_t>(capacity), '\0');
+    if (!CFStringGetCString(string, &result[0], capacity, kCFStringEncodingUTF8)) return {};
+    result.resize(strlen(result.c_str()));
+    return result;
+}
+
+bool appIdentifierMatches(const std::string &profileIdentifier, const std::string &team,
+                          const std::string &bundleIdentifier) {
+    const std::string prefix = team + ".";
+    if (profileIdentifier.compare(0, prefix.size(), prefix) != 0) return false;
+    const std::string pattern = profileIdentifier.substr(prefix.size());
+    const size_t wildcard = pattern.find('*');
+    if (wildcard == std::string::npos) return pattern == bundleIdentifier;
+    if (wildcard != pattern.size() - 1) return false;
+    return bundleIdentifier.compare(0, wildcard, pattern, 0, wildcard) == 0;
+}
+
+// Validate the exact identity/profile pair before asking zsign to produce a signature. A successful zsign return
+// only means that it wrote a signature; iOS still rejects it if the leaf certificate is not authorized by this
+// app's embedded profile. No certificate, key, password, Team ID, or profile contents are logged.
+bool validateIdentityProfile(const std::string &p12Bytes, const char *passphrase,
+                             const std::string &provisionBytes, const char *bundleIdentifier,
+                             std::string &reason) {
+    static OSSL_PROVIDER *defaultProvider = OSSL_PROVIDER_load(NULL, "default");
+    static OSSL_PROVIDER *legacyProvider = OSSL_PROVIDER_load(NULL, "legacy");
+    (void)defaultProvider; (void)legacyProvider;
+
+    const unsigned char *p12Cursor = reinterpret_cast<const unsigned char *>(p12Bytes.data());
+    PKCS12 *p12 = d2i_PKCS12(NULL, &p12Cursor, static_cast<long>(p12Bytes.size()));
+    if (!p12) { reason = "certificate/profile check: the stored .p12 could not be decoded"; return false; }
+    EVP_PKEY *privateKey = NULL;
+    X509 *leaf = NULL;
+    STACK_OF(X509) *chain = NULL;
+    const bool parsed = PKCS12_parse(p12, passphrase ? passphrase : "", &privateKey, &leaf, &chain) == 1;
+    PKCS12_free(p12);
+    if (!parsed || !privateKey || !leaf) {
+        EVP_PKEY_free(privateKey); X509_free(leaf); sk_X509_pop_free(chain, X509_free);
+        reason = "certificate/profile check: the .p12 did not yield a certificate and private key";
+        return false;
+    }
+    if (X509_check_private_key(leaf, privateKey) != 1) {
+        EVP_PKEY_free(privateKey); X509_free(leaf); sk_X509_pop_free(chain, X509_free);
+        reason = "certificate/profile check: the .p12 certificate does not match its private key";
+        return false;
+    }
+    const int notBefore = X509_cmp_current_time(X509_get0_notBefore(leaf));
+    const int notAfter = X509_cmp_current_time(X509_get0_notAfter(leaf));
+    if (notBefore == 0 || notAfter == 0 || notBefore > 0 || notAfter < 0) {
+        EVP_PKEY_free(privateKey); X509_free(leaf); sk_X509_pop_free(chain, X509_free);
+        reason = "certificate/profile check: the signing certificate is not currently valid";
+        return false;
+    }
+
+    BIO *bio = BIO_new_mem_buf(provisionBytes.data(), static_cast<int>(provisionBytes.size()));
+    CMS_ContentInfo *cms = bio ? d2i_CMS_bio(bio, NULL) : NULL;
+    BIO_free(bio);
+    ASN1_OCTET_STRING **content = cms ? CMS_get0_content(cms) : NULL;
+    if (!content || !*content || ASN1_STRING_length(*content) <= 0) {
+        CMS_ContentInfo_free(cms);
+        EVP_PKEY_free(privateKey); X509_free(leaf); sk_X509_pop_free(chain, X509_free);
+        reason = "certificate/profile check: embedded.mobileprovision is not a readable CMS profile";
+        return false;
+    }
+    CFDataRef plistData = CFDataCreate(kCFAllocatorDefault, ASN1_STRING_get0_data(*content),
+                                       ASN1_STRING_length(*content));
+    CMS_ContentInfo_free(cms);
+    CFPropertyListRef plist = plistData ? CFPropertyListCreateWithData(kCFAllocatorDefault, plistData,
+        kCFPropertyListImmutable, NULL, NULL) : NULL;
+    if (plistData) CFRelease(plistData);
+    if (!plist || CFGetTypeID(plist) != CFDictionaryGetTypeID()) {
+        if (plist) CFRelease(plist);
+        EVP_PKEY_free(privateKey); X509_free(leaf); sk_X509_pop_free(chain, X509_free);
+        reason = "certificate/profile check: the provisioning profile payload is not a property list";
+        return false;
+    }
+    CFDictionaryRef profile = static_cast<CFDictionaryRef>(plist);
+    CFArrayRef developerCertificates = static_cast<CFArrayRef>(CFDictionaryGetValue(profile, CFSTR("DeveloperCertificates")));
+    int leafLength = i2d_X509(leaf, NULL);
+    std::string leafDER;
+    if (leafLength > 0) {
+        leafDER.resize(static_cast<size_t>(leafLength));
+        unsigned char *out = reinterpret_cast<unsigned char *>(&leafDER[0]);
+        i2d_X509(leaf, &out);
+    }
+    bool certificateAuthorized = false;
+    if (developerCertificates && CFGetTypeID(developerCertificates) == CFArrayGetTypeID()) {
+        for (CFIndex i = 0; i < CFArrayGetCount(developerCertificates); ++i) {
+            CFTypeRef item = CFArrayGetValueAtIndex(developerCertificates, i);
+            if (item && CFGetTypeID(item) == CFDataGetTypeID()) {
+                CFDataRef candidate = static_cast<CFDataRef>(item);
+                if (static_cast<size_t>(CFDataGetLength(candidate)) == leafDER.size() &&
+                    memcmp(CFDataGetBytePtr(candidate), leafDER.data(), leafDER.size()) == 0) {
+                    certificateAuthorized = true;
+                    break;
+                }
+            }
+        }
+    }
+    if (!certificateAuthorized) {
+        CFRelease(plist);
+        EVP_PKEY_free(privateKey); X509_free(leaf); sk_X509_pop_free(chain, X509_free);
+        reason = "certificate/profile check: this .p12 certificate is not listed in the app's embedded provisioning profile";
+        return false;
+    }
+
+    CFDateRef expiration = static_cast<CFDateRef>(CFDictionaryGetValue(profile, CFSTR("ExpirationDate")));
+    if (!expiration || CFGetTypeID(expiration) != CFDateGetTypeID() ||
+        CFDateGetAbsoluteTime(expiration) <= CFAbsoluteTimeGetCurrent()) {
+        CFRelease(plist);
+        EVP_PKEY_free(privateKey); X509_free(leaf); sk_X509_pop_free(chain, X509_free);
+        reason = "certificate/profile check: the embedded provisioning profile is expired or has no expiration date";
+        return false;
+    }
+
+    CFArrayRef teams = static_cast<CFArrayRef>(CFDictionaryGetValue(profile, CFSTR("TeamIdentifier")));
+    std::string team;
+    if (teams && CFGetTypeID(teams) == CFArrayGetTypeID() && CFArrayGetCount(teams) > 0)
+        team = cfString(CFArrayGetValueAtIndex(teams, 0));
+    CFDictionaryRef entitlements = static_cast<CFDictionaryRef>(CFDictionaryGetValue(profile, CFSTR("Entitlements")));
+    CFTypeRef appIdentifierValue = (entitlements && CFGetTypeID(entitlements) == CFDictionaryGetTypeID())
+        ? CFDictionaryGetValue(entitlements, CFSTR("application-identifier")) : NULL;
+    const std::string appIdentifier = cfString(appIdentifierValue);
+    if (team.empty() || !appIdentifierMatches(appIdentifier, team, bundleIdentifier ? bundleIdentifier : "")) {
+        CFRelease(plist);
+        EVP_PKEY_free(privateKey); X509_free(leaf); sk_X509_pop_free(chain, X509_free);
+        reason = "certificate/profile check: the profile's Team ID or application-identifier does not authorize this iBuilder app";
+        return false;
+    }
+    CFTypeRef entitlementTeam = (entitlements && CFGetTypeID(entitlements) == CFDictionaryGetTypeID())
+        ? CFDictionaryGetValue(entitlements, CFSTR("com.apple.developer.team-identifier")) : NULL;
+    if (entitlementTeam && cfString(entitlementTeam) != team) {
+        CFRelease(plist);
+        EVP_PKEY_free(privateKey); X509_free(leaf); sk_X509_pop_free(chain, X509_free);
+        reason = "certificate/profile check: the profile's team entitlements disagree with its Team ID";
+        return false;
+    }
+
+    CFRelease(plist);
+    EVP_PKEY_free(privateKey); X509_free(leaf); sk_X509_pop_free(chain, X509_free);
+    return true;
+}
 
 // Replaces `path` with a byte-identical copy written by write(2), under a new inode.
 //
@@ -301,6 +451,12 @@ int nxpocket_zsign_sign_memory(const unsigned char *p12, int p12Length, const ch
     const std::string entitleData = (entitlements && entitlementsLength > 0)
         ? std::string(reinterpret_cast<const char *>(entitlements), static_cast<size_t>(entitlementsLength))
         : std::string();
+
+    std::string validationError;
+    if (!validateIdentityProfile(p12Data, passphrase, provData, identifier, validationError)) {
+        fail(error, errorLength, validationError.c_str());
+        return 1;
+    }
 
     ZSignAsset asset;
     // bSHA256Only on: an arm64 image wants the SHA-256 CodeDirectory in slot 0 (docs/SIGNING.md).
