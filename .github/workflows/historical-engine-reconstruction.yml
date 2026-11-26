@@ -1,0 +1,96 @@
+name: Historical NX2Apple engine reconstruction check
+
+on:
+  push:
+    branches:
+      - recovery/nx2apple-history
+
+permissions:
+  contents: read
+
+jobs:
+  apply-historical-patch-queue:
+    name: \${{ matrix.label }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Nov 15 snapshot (53 patches)
+            nx2apple_ref: 4be5b144ee764b620bbe094f5a03ebca9853e429
+          - label: Nov 15 snapshot (55 patches)
+            nx2apple_ref: 10f489aef6d8b6df94c6fdfe9d629f9381d80ab6
+          - label: Nov 18 snapshot (60 patches)
+            nx2apple_ref: 6432e020deb70b258d91b75457e291b25dd17d39
+          - label: Nov 18 snapshot (53 patches)
+            nx2apple_ref: 692775225724dca6c95d93dadef85235bf131628
+          - label: Nov 16 snapshot (58 patches)
+            nx2apple_ref: d5452a5ed0f76a57d42bdf92477dcf37fda3c14e
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the exact nxnative base
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/seedds/nxnative.git nxnative
+          git -C nxnative fetch --quiet --depth=1 origin a3663659342ef43afe1f29909c7c36d0cf7555be
+          git -C nxnative checkout --quiet --detach FETCH_HEAD
+          echo "Base: $(git -C nxnative rev-parse HEAD)"
+          echo "Base date: $(git -C nxnative show -s --format=%cI HEAD)"
+
+      - name: Fetch the historical NX2Apple patch queue
+        shell: bash
+        env:
+          NX2APPLE_REF: \${{ matrix.nx2apple_ref }}
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/LNPANDY/NX2Apple.git nx2apple
+          git -C nx2apple fetch --quiet --depth=1 origin "$NX2APPLE_REF"
+          git -C nx2apple checkout --quiet --detach FETCH_HEAD
+          echo "NX2Apple snapshot: $(git -C nx2apple rev-parse HEAD)"
+          echo "Pinned upstream: $(cat nx2apple/.upstream-ref)"
+          echo "Queued patches: $(grep -cE '^[0-9].*\\.patch$' nx2apple/patches/series)"
+
+      - name: Apply queue to a3663659 and report the first conflict
+        shell: bash
+        run: |
+          set -uo pipefail
+          pin="$(cat nx2apple/.upstream-ref)"
+          total="$(grep -cE '^[0-9].*\\.patch$' nx2apple/patches/series)"
+          applied=0
+          failed=""
+          git -C nxnative fetch --quiet --depth=1 origin "$pin"
+          if git -C nxnative merge-base --is-ancestor a3663659342ef43afe1f29909c7c36d0cf7555be FETCH_HEAD; then
+            echo "NX2Apple pin is a descendant of a3663659."
+          else
+            echo "NX2Apple pin is not a descendant of a3663659 (or ancestry is unavailable)."
+          fi
+          while IFS= read -r patch; do
+            [[ -z "$patch" || "$patch" == \#* ]] && continue
+            if git -C nxnative am -3 "$GITHUB_WORKSPACE/nx2apple/patches/$patch" > /tmp/patch-apply.log 2>&1; then
+              applied=$((applied + 1))
+            else
+              failed="$patch"
+              cat /tmp/patch-apply.log
+              git -C nxnative am --abort || true
+              break
+            fi
+          done < nx2apple/patches/series
+
+          {
+            echo "### \${{ matrix.label }}"
+            echo "- NX2Apple snapshot: \${{ matrix.nx2apple_ref }}"
+            echo "- Pinned upstream: $pin"
+            echo "- Patch queue: $total"
+            echo "- Applied cleanly: $applied"
+            if [[ -n "$failed" ]]; then
+              echo "- First conflict: $failed"
+            else
+              echo "- Result: **all patches applied**"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "RESULT total=$total applied=$applied first_conflict=\${failed:-none}"
+          [[ -z "$failed" ]]
